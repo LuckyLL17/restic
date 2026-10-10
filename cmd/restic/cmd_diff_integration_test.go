@@ -11,8 +11,12 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/restic/restic/internal/data"
+	"github.com/restic/restic/internal/diff"
 	"github.com/restic/restic/internal/global"
+	"github.com/restic/restic/internal/restic"
 	rtest "github.com/restic/restic/internal/test"
+	"github.com/restic/restic/internal/ui/progress"
 )
 
 func testRunDiffOutput(t testing.TB, gopts global.Options, firstSnapshotID string, secondSnapshotID string) (string, error) {
@@ -191,4 +195,113 @@ func TestDiffJSON(t *testing.T) {
 		stat.Removed.Files == 1 && stat.Removed.Dirs == 2 && stat.Removed.DataBlobs == 1 &&
 		stat.ChangedFiles == 1, "unexpected statistics")
 	rtest.Assert(t, stat.SourceSnapshot == firstSnapshotID && stat.TargetSnapshot == secondSnapshotID, "unexpected snapshot ids")
+}
+
+func parseDiffJSON(t *testing.T, out string) ([]Change, DiffStatsContainer) {
+	t.Helper()
+	var changes []Change
+	var stat DiffStatsContainer
+
+	scanner := bufio.NewScanner(strings.NewReader(out))
+	for scanner.Scan() {
+		var sniffer typeSniffer
+		rtest.OK(t, json.Unmarshal(scanner.Bytes(), &sniffer))
+		switch sniffer.MessageType {
+		case "change":
+			var ch Change
+			rtest.OK(t, json.Unmarshal(scanner.Bytes(), &ch))
+			changes = append(changes, ch)
+		case "statistics":
+			rtest.OK(t, json.Unmarshal(scanner.Bytes(), &stat))
+		default:
+			t.Fatalf("unexpected message type %v", sniffer.MessageType)
+		}
+	}
+	rtest.OK(t, scanner.Err())
+	return changes, stat
+}
+
+// TestDiffResumableSegments verifies against a real repository that running
+// the comparison as a sequence of segments, with the token serialized and
+// parsed (and the comparer recreated) between segments, produces exactly the
+// same changes and final statistics as the one-shot CLI command.
+func TestDiffResumableSegments(t *testing.T) {
+	env, cleanup, firstSnapshotID, secondSnapshotID := setupDiffRepo(t)
+	defer cleanup()
+
+	// one-shot reference via the CLI JSON output
+	env.gopts.Quiet = false
+	env.gopts.JSON = true
+	refOut, err := testRunDiffOutput(t, env.gopts, firstSnapshotID, secondSnapshotID)
+	rtest.OK(t, err)
+	refChanges, refStat := parseDiffJSON(t, refOut)
+
+	for _, maxNodes := range []int{1, 4, 64} {
+		t.Run("", func(t *testing.T) {
+			gopts := env.gopts
+			err := withTermStatus(t, gopts, func(ctx context.Context, gopts global.Options) error {
+				printer := progress.NewTerminalPrinter(gopts.JSON, gopts.Verbosity, gopts.Term)
+				ctx, repo, unlock, err := openWithReadLock(ctx, gopts, false, printer)
+				rtest.OK(t, err)
+				defer unlock()
+
+				be, err := restic.MemorizeList(ctx, repo, restic.SnapshotFile)
+				rtest.OK(t, err)
+
+				sn1, sub1, err := data.FindSnapshot(ctx, be, repo, firstSnapshotID)
+				rtest.OK(t, err)
+				sn2, sub2, err := data.FindSnapshot(ctx, be, repo, secondSnapshotID)
+				rtest.OK(t, err)
+
+				rtest.OK(t, repo.LoadIndex(ctx, printer))
+
+				root1, root2, err := diff.ResolveRoots(ctx, repo, sn1.Tree, sn2.Tree, sub1, sub2)
+				rtest.OK(t, err)
+
+				cmpOpts := diff.Options{}
+				token := diff.NewResumeToken(repo.Config().ID, *sn1.ID(), *sn2.ID(), sub1, sub2, root1, root2, cmpOpts)
+
+				var gotChanges []Change
+				segments := 0
+				for !token.Done {
+					// hand the token to another process: serialize, parse and
+					// recreate the comparer
+					buf, err := token.Marshal()
+					rtest.OK(t, err)
+					token, err = diff.ParseResumeToken(buf)
+					rtest.OK(t, err)
+					rtest.OK(t, token.Validate(repo.Config().ID, *sn1.ID(), *sn2.ID(), sub1, sub2, root1, root2, cmpOpts))
+
+					c := diff.NewComparer(repo, cmpOpts)
+					var res *diff.SegmentResult
+					res, err = c.RunSegment(ctx, token, diff.Budget{MaxNodes: maxNodes}, func(ch *diff.Change) {
+						gotChanges = append(gotChanges, Change{
+							MessageType: "change",
+							Path:        ch.Path,
+							Modifier:    ch.Modifier,
+						})
+					}, func(err error) {
+						t.Errorf("unexpected diff error: %v", err)
+					})
+					rtest.OK(t, err)
+					if !token.Done {
+						rtest.Equals(t, diff.StatusIncomplete, res.Status)
+						rtest.Assert(t, len(res.Position.Stack) > 0, "expected continuation position")
+					}
+					segments++
+					rtest.Assert(t, segments < 10000, "comparison did not finish")
+				}
+
+				rtest.Equals(t, refChanges, gotChanges)
+				rtest.Equals(t, refStat.Added, token.Added)
+				rtest.Equals(t, refStat.Removed, token.Removed)
+				rtest.Equals(t, refStat.ChangedFiles, token.ChangedFiles)
+				if maxNodes == 1 {
+					rtest.Assert(t, segments > 1, "budget of 1 node must require multiple segments")
+				}
+				return nil
+			})
+			rtest.OK(t, err)
+		})
+	}
 }

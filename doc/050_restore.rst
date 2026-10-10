@@ -162,6 +162,30 @@ the whole system.
 The ``--delete`` option also allows overwriting a non-empty directory if the snapshot contains a
 file with the same name.
 
+Atomic restore
+--------------
+
+By default, ``restore`` modifies the target directory in place. If the operation is interrupted or
+fails partway through, for example because a file, hard link or metadata cannot be written, the
+target directory is left in a partially restored state.
+
+Pass ``--atomic`` to restore into a hidden temporary directory next to the target directory
+instead. The snapshot is restored there in full, including files, directories, hard links,
+metadata and the deletions requested by ``--delete``. Only once the complete restore succeeds is
+the temporary directory switched into place at the target path. If the restore is canceled or fails
+at any point before that, the target directory remains exactly as it was before the operation and
+all temporary data is removed.
+
+.. code-block:: console
+
+    $ restic -r /srv/restic-repo restore --atomic --target /srv/data latest
+
+The temporary directory is created in the same directory as the target and must reside on the same
+filesystem so that the final switch can be performed atomically. Restoring to the root directory
+(``/``) is not supported. The ``--atomic`` option can be combined with ``--overwrite``,
+``--delete``, ``--include``/``--exclude``, ``--sparse`` and the other restore options, which keep
+their usual behavior. With ``--dry-run`` no temporary directory is created.
+
 Dry runs
 --------
 

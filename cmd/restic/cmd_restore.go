@@ -71,6 +71,7 @@ type RestoreOptions struct {
 	Verify              bool
 	Overwrite           restorer.OverwriteBehavior
 	Delete              bool
+	Atomic              bool
 	ExcludeXattrPattern []string
 	IncludeXattrPattern []string
 	OwnershipByName     bool
@@ -91,6 +92,7 @@ func (opts *RestoreOptions) AddFlags(f *pflag.FlagSet) {
 	f.BoolVar(&opts.Verify, "verify", false, "verify restored files content")
 	f.Var(&opts.Overwrite, "overwrite", "overwrite behavior, one of (always|if-changed|if-newer|never)")
 	f.BoolVar(&opts.Delete, "delete", false, "delete files from target directory if they do not exist in snapshot. Use '--dry-run -vv' to check what would be deleted")
+	f.BoolVar(&opts.Atomic, "atomic", false, "restore into a temporary directory and switch it into place after the restore completes; the target directory is left unchanged on error or cancellation")
 	if runtime.GOOS != "windows" {
 		f.BoolVar(&opts.OwnershipByName, "ownership-by-name", false, "restore file ownership by user name and group name (except POSIX ACLs)")
 	}
@@ -142,6 +144,10 @@ func runRestore(ctx context.Context, opts RestoreOptions, gopts global.Options,
 		return errors.Fatal("'--target / --delete' must be combined with an include or exclude filter")
 	}
 
+	if opts.Atomic && filepath.Clean(opts.Target) == string(filepath.Separator) {
+		return errors.Fatal("'--atomic' cannot be used when restoring to '/'")
+	}
+
 	snapshotIDString := args[0]
 
 	debug.Log("restore %v to %v", snapshotIDString, opts.Target)
@@ -175,6 +181,7 @@ func runRestore(ctx context.Context, opts RestoreOptions, gopts global.Options,
 		Overwrite:       opts.Overwrite,
 		Delete:          opts.Delete,
 		OwnershipByName: opts.OwnershipByName,
+		Atomic:          opts.Atomic,
 	})
 
 	totalErrors := 0

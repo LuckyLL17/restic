@@ -1,0 +1,10 @@
+Enhancement: Add `--atomic` option to the `restore` command
+
+The `restore` command now supports an `--atomic` option. The selected snapshot
+is first restored into a hidden temporary directory next to the target
+directory, including files, directories, hard links, metadata and the
+deletions requested by `--delete`. Only after the complete restore succeeds is
+the temporary directory switched into place. If the restore is canceled or
+fails at any point before that, the target directory remains in its previous
+state. The option can be combined with the existing overwrite, filter, sparse
+and dry-run options, which keep their usual behavior.

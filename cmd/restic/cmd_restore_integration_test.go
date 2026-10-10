@@ -400,6 +400,55 @@ func TestRestoreNoMetadataOnIgnoredIntermediateDirs(t *testing.T) {
 		"meta data of intermediate directory hasn't been restore")
 }
 
+func TestRestoreAtomic(t *testing.T) {
+	env, cleanup := withTestEnvironment(t)
+	defer cleanup()
+
+	testRunInit(t, env.gopts)
+
+	rtest.OK(t, os.MkdirAll(filepath.Join(env.testdata, "subdir"), 0o755))
+	rtest.OK(t, appendRandomData(filepath.Join(env.testdata, "foo"), 42))
+	rtest.OK(t, appendRandomData(filepath.Join(env.testdata, "subdir", "bar"), 43))
+
+	opts := BackupOptions{}
+	testRunBackup(t, filepath.Dir(env.testdata), []string{filepath.Base(env.testdata)}, opts, env.gopts)
+	testRunCheck(t, env.gopts)
+	snapshotID := testListSnapshots(t, env.gopts, 1)[0]
+
+	restoredir := filepath.Join(env.base, "restore")
+	rtest.OK(t, os.Mkdir(restoredir, 0o755))
+	rtest.OK(t, os.WriteFile(filepath.Join(restoredir, "preexisting"), []byte("keep"), 0o600))
+
+	rtest.OK(t, testRunRestoreAssumeFailure(t, snapshotID.String(), RestoreOptions{
+		Target: restoredir,
+		Atomic: true,
+	}, env.gopts))
+
+	// the snapshot data is present ...
+	diff := directoriesContentsDiff(t, env.testdata, filepath.Join(restoredir, filepath.Base(env.testdata)))
+	rtest.Assert(t, diff == "", "directories are not equal %v", diff)
+	// ... and the pre-existing user data is preserved
+	data, err := os.ReadFile(filepath.Join(restoredir, "preexisting"))
+	rtest.OK(t, err)
+	rtest.Equals(t, "keep", string(data))
+
+	// no temporary directories are left behind
+	entries, err := os.ReadDir(env.base)
+	rtest.OK(t, err)
+	for _, entry := range entries {
+		rtest.Assert(t, !strings.HasPrefix(entry.Name(), ".restic-restore-"), "unexpected leftover %v", entry.Name())
+	}
+
+	// an atomic restore with --delete removes user data not present in the snapshot
+	rtest.OK(t, testRunRestoreAssumeFailure(t, snapshotID.String(), RestoreOptions{
+		Target: restoredir,
+		Atomic: true,
+		Delete: true,
+	}, env.gopts))
+	_, err = os.Stat(filepath.Join(restoredir, "preexisting"))
+	rtest.Assert(t, os.IsNotExist(err), "preexisting file should have been deleted, got %v", err)
+}
+
 func TestRestoreDefaultLayout(t *testing.T) {
 	env, cleanup := withTestEnvironment(t)
 	defer cleanup()

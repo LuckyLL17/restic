@@ -34,6 +34,12 @@ type Restorer struct {
 	SelectFilter func(item string, isDir bool) (selectedForRestore bool, childMayBeSelected bool)
 
 	XattrSelectFilter func(xattrName string) (xattrSelectedForRestore bool)
+
+	// atomicStage/atomicTarget are set while an atomic restore is in progress.
+	// The restore then operates on atomicStage instead of atomicTarget.
+	atomicStage          string
+	atomicTarget         string
+	atomicDeleteExpected map[string][]string
 }
 
 var restorerAbortOnAllErrors = func(_ string, err error) error { return err }
@@ -45,6 +51,11 @@ type Options struct {
 	Overwrite       OverwriteBehavior
 	Delete          bool
 	OwnershipByName bool
+	// Atomic restores the snapshot into a temporary staging directory and only
+	// switches the staging directory into place after the complete restore
+	// succeeded. On error or cancellation the target directory is left
+	// untouched.
+	Atomic bool
 }
 
 type OverwriteBehavior int
@@ -344,6 +355,73 @@ func (res *Restorer) ensureDir(target string) error {
 // RestoreTo creates the directories and files in the snapshot below dst.
 // Before an item is created, res.Filter is called.
 func (res *Restorer) RestoreTo(ctx context.Context, dst string) (uint64, error) {
+	if res.opts.Atomic && !res.opts.DryRun {
+		return res.restoreToAtomic(ctx, dst)
+	}
+	return res.restoreTo(ctx, dst)
+}
+
+// restoreToAtomic runs the regular restore against a staging directory and
+// switches the staging directory into place once everything succeeded.
+func (res *Restorer) restoreToAtomic(ctx context.Context, dst string) (restoredFileCount uint64, err error) {
+	if !filepath.IsAbs(dst) {
+		dst, err = filepath.Abs(dst)
+		if err != nil {
+			return 0, errors.Wrap(err, "Abs")
+		}
+	}
+
+	stage, targetExisted, rootMeta, err := res.prepareAtomicStage(dst)
+	if err != nil {
+		return 0, err
+	}
+
+	switched := false
+	defer func() {
+		if !switched {
+			_ = fs.RemoveAll(stage)
+		}
+	}()
+
+	res.atomicStage = stage
+	res.atomicTarget = dst
+	res.atomicDeleteExpected = make(map[string][]string)
+	previousProgress := res.opts.Progress
+	res.opts.Progress = &stagingProgress{ProgressReporter: previousProgress, stage: stage, target: dst}
+	defer func() {
+		res.atomicStage = ""
+		res.atomicTarget = ""
+		res.atomicDeleteExpected = nil
+		res.opts.Progress = previousProgress
+	}()
+
+	restoredFileCount, err = res.restoreTo(ctx, stage)
+	if err != nil {
+		return 0, err
+	}
+
+	switcher := &atomicSwitch{
+		ctx:                  ctx,
+		stage:                stage,
+		target:               dst,
+		deleteExpected:       res.atomicDeleteExpected,
+		allowRecursiveDelete: res.opts.Delete,
+		selectFilter:         res.SelectFilter,
+		warn:                 res.Warn,
+	}
+	if err = switcher.commit(targetExisted, rootMeta); err != nil {
+		if switcher.trash != "" {
+			_ = fs.RemoveAll(switcher.trash)
+		}
+		return 0, err
+	}
+	switched = true
+	return restoredFileCount, nil
+}
+
+// restoreTo runs the regular, non-atomic restore. In atomic mode, dst points at
+// the staging directory.
+func (res *Restorer) restoreTo(ctx context.Context, dst string) (uint64, error) {
 	restoredFileCount := uint64(0)
 	var err error
 	if !filepath.IsAbs(dst) {
@@ -393,6 +471,13 @@ func (res *Restorer) RestoreTo(ctx context.Context, dst string) (uint64, error) 
 				return nil
 			}
 
+			// during an atomic restore, seed the staging directory from the
+			// existing target so that the overwrite checks below see the same
+			// state as during an in-place restore
+			if err := res.seedFromTarget(target); err != nil {
+				return err
+			}
+
 			if node.Links > 1 {
 				if idx.Has(node.Inode, node.DeviceID) {
 					// a hardlinked file does not increase the restore size
@@ -426,6 +511,15 @@ func (res *Restorer) RestoreTo(ctx context.Context, dst string) (uint64, error) 
 			})
 			return err
 		},
+
+		leaveDir: func(_ *data.Node, _ string, location string, expectedFilenames []string) error {
+			// remember the snapshot contents of each restored directory so
+			// that the atomic switch can apply the deletion plan there
+			if res.atomicStage != "" && res.opts.Delete {
+				res.atomicDeleteExpected[location] = expectedFilenames
+			}
+			return nil
+		},
 	})
 	if err != nil {
 		return 0, err
@@ -438,6 +532,12 @@ func (res *Restorer) RestoreTo(ctx context.Context, dst string) (uint64, error) 
 		}
 	}
 
+	// during an atomic restore, files whose content was not restored must be
+	// detached from the target before their metadata is updated in pass two
+	if err := res.detachSeededFiles(); err != nil {
+		return 0, err
+	}
+
 	debug.Log("second pass for %q", dst)
 
 	// second tree pass: restore special files and filesystem metadata
@@ -445,6 +545,9 @@ func (res *Restorer) RestoreTo(ctx context.Context, dst string) (uint64, error) 
 		visitNode: func(node *data.Node, target, location string) error {
 			debug.Log("second pass, visitNode: restore node %q", location)
 			if node.Type != data.NodeTypeFile {
+				if err := res.seedFromTarget(target); err != nil {
+					return err
+				}
 				_, err := res.withOverwriteCheck(ctx, node, target, location, false, nil, func(_ bool, _ *fileState) error {
 					return res.restoreNodeTo(node, target, location)
 				})
@@ -452,6 +555,9 @@ func (res *Restorer) RestoreTo(ctx context.Context, dst string) (uint64, error) 
 			}
 
 			if idx.Has(node.Inode, node.DeviceID) && idx.Value(node.Inode, node.DeviceID) != location {
+				if err := res.seedFromTarget(target); err != nil {
+					return err
+				}
 				_, err := res.withOverwriteCheck(ctx, node, target, location, true, nil, func(_ bool, _ *fileState) error {
 					return res.restoreHardlinkAt(node, filerestorer.targetPath(idx.Value(node.Inode, node.DeviceID)), target, location)
 				})

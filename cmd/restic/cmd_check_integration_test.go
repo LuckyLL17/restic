@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -99,4 +101,38 @@ func TestCheckWithSnaphotFilter(t *testing.T) {
 		hasOutput := strings.Contains(output, testCase.expectedOutput)
 		rtest.Assert(t, hasOutput, `expected to find substring %q, but did not find it`, testCase.expectedOutput)
 	}
+}
+
+func TestCheckReadDataPlan(t *testing.T) {
+	env, cleanup := withTestEnvironment(t)
+	defer cleanup()
+
+	testSetupBackupData(t, env)
+	backupOpts := BackupOptions{}
+	testRunBackup(t, env.testdata+"/0", []string{"for_cmd_ls"}, backupOpts, env.gopts)
+
+	planPath := filepath.Join(t.TempDir(), "plan.json")
+	checkOpts := CheckOptions{ReadDataPlan: planPath}
+
+	// the first run creates the plan and verifies all packs
+	output, err := testRunCheckOutputWithOpts(t, env.gopts, checkOpts, nil)
+	rtest.OK(t, err)
+	rtest.Assert(t, strings.Contains(output, "creating new read-data plan"), "missing plan creation output: %v", output)
+	rtest.Assert(t, strings.Contains(output, "covers all"), "missing plan completion output: %v", output)
+	_, err = os.Stat(planPath)
+	rtest.OK(t, err)
+
+	// the second run resumes the finished plan without reading any packs again
+	output, err = testRunCheckOutputWithOpts(t, env.gopts, checkOpts, nil)
+	rtest.OK(t, err)
+	rtest.Assert(t, strings.Contains(output, "resuming read-data plan"), "missing resume output: %v", output)
+	rtest.Assert(t, strings.Contains(output, "fragments done"), "missing plan progress output: %v", output)
+
+	// a new backup changes the repository and invalidates the stored plan
+	testRunBackup(t, env.testdata+"/0", []string{"0/9"}, backupOpts, env.gopts)
+	output, err = testRunCheckOutputWithOpts(t, env.gopts, checkOpts, nil)
+	rtest.OK(t, err)
+	rtest.Assert(t, strings.Contains(output, "outdated because the repository changed, rebuilding"),
+		"missing plan rebuild output: %v", output)
+	rtest.Assert(t, strings.Contains(output, "covers all"), "missing plan completion output: %v", output)
 }

@@ -551,6 +551,32 @@ a file size value the following command may be used:
     $ restic -r /srv/restic-repo check --read-data-subset=50M
     $ restic -r /srv/restic-repo check --read-data-subset=10G
 
+For large repositories a full ``--read-data`` check may take longer than a
+single maintenance window. The ``--read-data-plan`` option persists the
+verification progress in a plan file and divides the packs into stable
+fragments which are checked one after another:
+
+.. code-block:: console
+
+    $ restic -r /srv/restic-repo check --read-data-plan=/var/tmp/restic-read-data-plan.json
+
+If the command is interrupted, re-running it with the same plan file resumes
+at the first unfinished fragment; fragments that failed are retried on the
+next run. Completed fragments are not read again. A completed plan can be
+kept and reused: as long as the repository is unchanged, a re-run finishes
+immediately. Use the special value ``auto`` to store the plan as
+``inspection-plan.json`` in the local cache directory of the repository
+instead of naming an explicit file.
+
+The plan records the packs and index files it was built from. Whenever packs
+are added or removed, or the index changes (for example after a backup,
+``prune`` or ``repair index``), a stored plan is detected as outdated,
+discarded and rebuilt from scratch, so completed coverage is never mistaken
+for coverage of the new repository state.
+
+``--read-data-plan`` cannot be combined with ``--read-data`` or
+``--read-data-subset``.
+
 Finding things in the repository
 ================================
 

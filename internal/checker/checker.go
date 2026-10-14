@@ -9,6 +9,7 @@ import (
 	"github.com/restic/restic/internal/debug"
 	"github.com/restic/restic/internal/errors"
 	"github.com/restic/restic/internal/repository"
+	"github.com/restic/restic/internal/repository/pack"
 	"github.com/restic/restic/internal/restic"
 )
 
@@ -324,4 +325,59 @@ func (c *Checker) ReadPacks(ctx context.Context, filter func(packs map[restic.ID
 	}
 
 	c.Checker.ReadPacks(ctx, packfileFilter, printer, errChan)
+}
+
+// InspectionData collects the pack sets required to build a persistent
+// read-data inspection plan.
+//
+// Packs contains the packs that must be covered. Without snapshot filtering
+// this is the set of all packs referenced by the index; with snapshot
+// filtering it is restricted to the packs encompassing the referenced blobs.
+// AllPacks always contains all packs referenced by the index, RepoPacks the
+// packs physically stored in the repository (with their backend sizes), and
+// IndexIDs the set of loaded index files. AllPacks, RepoPacks and IndexIDs
+// describe the full repository state and are used to detect changes.
+func (c *Checker) InspectionData(ctx context.Context) (InspectionData, error) {
+	allPacks, err := pack.Size(ctx, c.repo, false)
+	if err != nil {
+		return InspectionData{}, err
+	}
+
+	// reuse the listing collected by Packs to avoid querying the backend twice
+	repoPacks, err := c.ListStoredPacks(ctx)
+	if err != nil {
+		return InspectionData{}, err
+	}
+
+	coveredPacks := allPacks
+	if c.IsFiltered() {
+		coveredPacks = make(map[restic.ID]int64)
+		c.blobRefs.Lock()
+		defer c.blobRefs.Unlock()
+
+		// convert used blobs into their encompassing packfiles
+		for bh := range c.blobRefs.M.Keys() {
+			for _, pb := range c.repo.LookupBlob(bh) {
+				if size, ok := allPacks[pb.PackID()]; ok {
+					coveredPacks[pb.PackID()] = size
+				}
+			}
+		}
+	}
+
+	return InspectionData{
+		Packs:     coveredPacks,
+		AllPacks:  allPacks,
+		RepoPacks: repoPacks,
+		IndexIDs:  c.IndexIDs(),
+	}, nil
+}
+
+// InspectionData contains the pack sets used to build and validate an
+// inspection plan.
+type InspectionData struct {
+	Packs     map[restic.ID]int64
+	AllPacks  map[restic.ID]int64
+	RepoPacks map[restic.ID]int64
+	IndexIDs  restic.IDSet
 }

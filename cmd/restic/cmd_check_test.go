@@ -4,6 +4,7 @@ import (
 	"io/fs"
 	"math"
 	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
@@ -180,6 +181,44 @@ func checkIfFileWithSimilarNameExists(files []fs.DirEntry, fileName string) bool
 		}
 	}
 	return found
+}
+
+func TestCheckFlagsReadDataPlan(t *testing.T) {
+	testCases := []struct {
+		name        string
+		opts        CheckOptions
+		expectError bool
+	}{
+		{"plan only", CheckOptions{ReadDataPlan: "plan.json"}, false},
+		{"plan in cache", CheckOptions{ReadDataPlan: "auto"}, false},
+		{"plan and read-data", CheckOptions{ReadDataPlan: "plan.json", ReadData: true}, true},
+		{"plan and read-data-subset", CheckOptions{ReadDataPlan: "plan.json", ReadDataSubset: "1/2"}, true},
+		{"read-data and subset", CheckOptions{ReadData: true, ReadDataSubset: "1/2"}, true},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			err := checkFlags(testCase.opts)
+			if testCase.expectError {
+				rtest.Assert(t, err != nil, "expected an error for %+v", testCase.opts)
+			} else {
+				rtest.Assert(t, err == nil, "unexpected error for %+v: %v", testCase.opts, err)
+			}
+		})
+	}
+}
+
+func TestResolveInspectionPlanPath(t *testing.T) {
+	custom := filepath.Join(t.TempDir(), "plan.json")
+	path, err := resolveInspectionPlanPath(custom, restic.Config{})
+	rtest.OK(t, err)
+	rtest.Equals(t, custom, path)
+
+	cacheDir := t.TempDir()
+	t.Setenv("RESTIC_CACHE_DIR", cacheDir)
+	path, err = resolveInspectionPlanPath("auto", restic.Config{ID: "repo-id"})
+	rtest.OK(t, err)
+	rtest.Equals(t, filepath.Join(cacheDir, "repo-id", "inspection-plan.json"), path)
 }
 
 func TestPrepareCheckCache(t *testing.T) {

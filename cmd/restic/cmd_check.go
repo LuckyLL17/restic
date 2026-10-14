@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math/rand"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -15,6 +16,7 @@ import (
 
 	"github.com/restic/restic/internal/backend/cache"
 	"github.com/restic/restic/internal/checker"
+	"github.com/restic/restic/internal/checker/inspection"
 	"github.com/restic/restic/internal/data"
 	"github.com/restic/restic/internal/errors"
 	"github.com/restic/restic/internal/global"
@@ -75,6 +77,7 @@ Exit status is 12 if the password is incorrect.
 type CheckOptions struct {
 	ReadData       bool
 	ReadDataSubset string
+	ReadDataPlan   string
 	CheckUnused    bool
 	WithCache      bool
 	data.SnapshotFilter
@@ -83,6 +86,7 @@ type CheckOptions struct {
 func (opts *CheckOptions) AddFlags(f *pflag.FlagSet) {
 	f.BoolVar(&opts.ReadData, "read-data", false, "read all data blobs")
 	f.StringVar(&opts.ReadDataSubset, "read-data-subset", "", "read a `subset` of data packs, specified as 'n/t' for specific part, or either 'x%' or 'x.y%' or a size in bytes with suffixes k/K, m/M, g/G, t/T for a random subset")
+	f.StringVar(&opts.ReadDataPlan, "read-data-plan", "", "persist the read-data progress in a plan `file` and resume interrupted checks; use 'auto' to store the plan in the local cache directory")
 	var ignored bool
 	f.BoolVar(&ignored, "check-unused", false, "find unused blobs")
 	err := f.MarkDeprecated("check-unused", "`--check-unused` is deprecated and will be ignored")
@@ -97,6 +101,9 @@ func (opts *CheckOptions) AddFlags(f *pflag.FlagSet) {
 func checkFlags(opts CheckOptions) error {
 	if opts.ReadData && opts.ReadDataSubset != "" {
 		return errors.Fatal("check flags --read-data and --read-data-subset cannot be used together")
+	}
+	if opts.ReadDataPlan != "" && (opts.ReadData || opts.ReadDataSubset != "") {
+		return errors.Fatal("check flag --read-data-plan cannot be used together with --read-data or --read-data-subset")
 	}
 	if opts.ReadDataSubset != "" {
 		dataSubset, err := stringToIntSlice(opts.ReadDataSubset)
@@ -386,22 +393,28 @@ func runCheck(ctx context.Context, opts CheckOptions, gopts global.Options, args
 		}
 	}
 
-	readDataFilter, err := buildPacksFilter(opts, printer, chkr.IsFiltered())
-	if err != nil {
-		return summary, err
-	}
+	if opts.ReadDataPlan != "" {
+		if err := runReadDataPlan(ctx, opts.ReadDataPlan, chkr, printer, &summary, &errorsFound, salvagePacks); err != nil {
+			return summary, err
+		}
+	} else {
+		readDataFilter, err := buildPacksFilter(opts, printer, chkr.IsFiltered())
+		if err != nil {
+			return summary, err
+		}
 
-	if readDataFilter != nil {
-		errChan := make(chan error)
+		if readDataFilter != nil {
+			errChan := make(chan error)
 
-		go chkr.ReadPacks(ctx, readDataFilter, printer, errChan)
+			go chkr.ReadPacks(ctx, readDataFilter, printer, errChan)
 
-		for err := range errChan {
-			errorsFound = true
-			summary.NumErrors++
-			printer.E("%v\n", err)
-			if err, ok := err.(*repository.ErrPackData); ok {
-				salvagePacks.Insert(err.PackID)
+			for err := range errChan {
+				errorsFound = true
+				summary.NumErrors++
+				printer.E("%v\n", err)
+				if err, ok := err.(*repository.ErrPackData); ok {
+					salvagePacks.Insert(err.PackID)
+				}
 			}
 		}
 	}
@@ -535,6 +548,146 @@ func selectRandomPacksByFileSize(allPacks map[restic.ID]int64, subsetSize int64,
 	subsetPercentage := (float64(subsetSize) / float64(repoSize)) * 100.0
 	packs := selectRandomPacksByPercentage(allPacks, subsetPercentage)
 	return packs
+}
+
+// resolveInspectionPlanPath resolves the plan file location. The special
+// value "auto" places the plan in the local cache directory for the current
+// repository, independently of the temporary cache used by check itself.
+func resolveInspectionPlanPath(planPath string, repoConfig restic.Config) (string, error) {
+	if planPath != "auto" {
+		return planPath, nil
+	}
+
+	basedir, err := cache.DefaultDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(basedir, repoConfig.ID, "inspection-plan.json"), nil
+}
+
+// runReadDataPlan runs the read-data verification according to a persistent
+// inspection plan. It creates a plan if none exists, rebuilds it when the
+// repository changed since the plan was created, and otherwise resumes at the
+// first unfinished fragment. Failed fragments are retried in a new run.
+//
+// Error reporting is identical to a plain --read-data run: every verification
+// error is printed and counted, damaged packs are collected for the repair
+// suggestion, and a non-zero result is turned into the usual fatal error by
+// the caller.
+func runReadDataPlan(ctx context.Context, planOption string, chkr *checker.Checker,
+	printer restic.Printer, summary *checkSummary, errorsFound *bool, salvagePacks restic.IDSet) error {
+	planPath, err := resolveInspectionPlanPath(planOption, chkr.Config())
+	if err != nil {
+		return err
+	}
+
+	state, err := chkr.InspectionData(ctx)
+	if err != nil {
+		return err
+	}
+
+	fingerprint := inspection.Fingerprint(chkr.Config().ID, state.IndexIDs.List(), state.Packs, state.AllPacks, state.RepoPacks)
+
+	plan, err := inspection.Open(planPath)
+	switch {
+	case err == nil && plan.Matches(fingerprint):
+		done, failed, pending, claimed := plan.Counts()
+		printer.P("resuming read-data plan %v: %d/%d fragments done (%d pending, %d to retry, %d interrupted)\n",
+			planPath, done, done+failed+pending+claimed, pending, failed, claimed)
+	case err == nil:
+		printer.P("read-data plan %v is outdated because the repository changed, rebuilding\n", planPath)
+		plan = inspection.New(fingerprint, state.Packs, inspection.DefaultPacksPerFragment, time.Now())
+	case errors.Is(err, os.ErrNotExist):
+		printer.P("creating new read-data plan %v\n", planPath)
+		plan = inspection.New(fingerprint, state.Packs, inspection.DefaultPacksPerFragment, time.Now())
+	default:
+		printer.P("unable to read read-data plan %v: %v\nrebuilding plan\n", planPath, err)
+		plan = inspection.New(fingerprint, state.Packs, inspection.DefaultPacksPerFragment, time.Now())
+	}
+	plan.SetPath(planPath)
+	if err := plan.Save(); err != nil {
+		return err
+	}
+
+	totalFragments := len(plan.Fragments)
+
+	for {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+
+		fragment := plan.Claim(time.Now(), inspection.DefaultLeaseDuration)
+		if fragment == nil {
+			break
+		}
+		if err := plan.Save(); err != nil {
+			return err
+		}
+		printer.V("claim fragment %d/%d with %d packs\n", fragment.Index+1, totalFragments, len(fragment.Packs))
+
+		fragmentErrs := readPlanFragment(ctx, chkr, fragment, printer)
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+
+		for _, err := range fragmentErrs {
+			*errorsFound = true
+			summary.NumErrors++
+			printer.E("%v\n", err)
+			if err, ok := err.(*repository.ErrPackData); ok {
+				salvagePacks.Insert(err.PackID)
+			}
+		}
+
+		if len(fragmentErrs) > 0 {
+			if err := plan.Fail(fragment, time.Now(), fragmentErrs[len(fragmentErrs)-1]); err != nil {
+				return err
+			}
+		} else {
+			if err := plan.Succeed(fragment, time.Now()); err != nil {
+				return err
+			}
+		}
+		if err := plan.Save(); err != nil {
+			return err
+		}
+	}
+
+	done, failed, pending, claimed := plan.Counts()
+	switch {
+	case failed > 0:
+		printer.P("read-data plan %v: %d of %d fragments failed, rerun the check to retry them\n", planPath, failed, done+failed+pending+claimed)
+	case pending == 0 && claimed == 0 && done > 0:
+		printer.P("read-data plan %v covers all %d packs\n", planPath, plan.PackCount)
+	}
+	return nil
+}
+
+// readPlanFragment checks the packs of a single claimed fragment.
+func readPlanFragment(ctx context.Context, chkr *checker.Checker, fragment *inspection.Fragment, printer restic.Printer) []error {
+	fragmentPacks := restic.NewIDSet()
+	for _, id := range fragment.Packs {
+		fragmentPacks.Insert(id)
+	}
+
+	filter := func(packs map[restic.ID]int64) map[restic.ID]int64 {
+		selected := make(map[restic.ID]int64, len(fragmentPacks))
+		for id, size := range packs {
+			if fragmentPacks.Has(id) {
+				selected[id] = size
+			}
+		}
+		return selected
+	}
+
+	errChan := make(chan error)
+	go chkr.ReadPacks(ctx, filter, printer, errChan)
+
+	var errs []error
+	for err := range errChan {
+		errs = append(errs, err)
+	}
+	return errs
 }
 
 type checkSummary struct {

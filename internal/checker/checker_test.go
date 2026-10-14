@@ -14,6 +14,7 @@ import (
 
 	"github.com/restic/restic/internal/backend"
 	"github.com/restic/restic/internal/checker"
+	"github.com/restic/restic/internal/checker/inspection"
 	"github.com/restic/restic/internal/data"
 	"github.com/restic/restic/internal/errors"
 	"github.com/restic/restic/internal/repository"
@@ -392,6 +393,118 @@ func TestCheckerModifiedData(t *testing.T) {
 			test.check(t, err)
 		})
 	}
+}
+
+func TestInspectionPlan(t *testing.T) {
+	ctx := context.TODO()
+	repo, _, be := repository.TestRepositoryWithVersion(t, 0)
+	data.TestCreateSnapshot(t, repo, time.Unix(1470492820, 207401672), 2)
+
+	chkr := checker.New(repo, false)
+	test.OK(t, chkr.LoadSnapshots(ctx, &data.SnapshotFilter{}, nil))
+	hints, indexErrs := chkr.LoadIndex(ctx, restic.NoopTerminalCounterFactory)
+	test.OKs(t, indexErrs)
+	test.Assert(t, len(hints) == 0, "unexpected hints: %v", hints)
+
+	loadState := func() checker.InspectionData {
+		state, err := chkr.InspectionData(ctx)
+		test.OK(t, err)
+		return state
+	}
+	fingerprintFor := func(state checker.InspectionData) string {
+		return inspection.Fingerprint(repo.Config().ID, state.IndexIDs.List(), state.Packs, state.AllPacks, state.RepoPacks)
+	}
+
+	state := loadState()
+	test.Assert(t, len(state.Packs) >= 2, "expected at least two packs, got %d", len(state.Packs))
+	test.Equals(t, len(state.AllPacks), len(state.RepoPacks))
+	test.Assert(t, len(state.IndexIDs) > 0, "expected loaded indexes")
+	fingerprint := fingerprintFor(state)
+	test.Equals(t, fingerprint, fingerprintFor(state))
+
+	planPath := filepath.Join(t.TempDir(), "plan.json")
+	plan := inspection.New(fingerprint, state.Packs, 1, time.Now())
+	plan.SetPath(planPath)
+	test.OK(t, plan.Save())
+
+	runFragment := func(f *inspection.Fragment) []error {
+		fragmentPacks := restic.NewIDSet()
+		for _, id := range f.Packs {
+			fragmentPacks.Insert(id)
+		}
+		return collectErrors(ctx, func(ctx context.Context, errChan chan<- error) {
+			chkr.ReadPacks(ctx, func(packs map[restic.ID]int64) map[restic.ID]int64 {
+				selected := make(map[restic.ID]int64)
+				for id, size := range packs {
+					if fragmentPacks.Has(id) {
+						selected[id] = size
+					}
+				}
+				return selected
+			}, restic.NewNoopPrinter(), errChan)
+		})
+	}
+
+	// first run: complete fragment 0, then claim fragment 1 and "crash"
+	covered := restic.NewIDSet()
+	fragment := plan.Claim(time.Now(), inspection.DefaultLeaseDuration)
+	test.Equals(t, 0, fragment.Index)
+	test.OKs(t, runFragment(fragment))
+	for _, id := range fragment.Packs {
+		covered.Insert(id)
+	}
+	test.OK(t, plan.Succeed(fragment, time.Now()))
+	test.OK(t, plan.Save())
+
+	interrupted := plan.Claim(time.Now(), inspection.DefaultLeaseDuration)
+	test.Equals(t, 1, interrupted.Index)
+	test.OK(t, plan.Save())
+
+	// second run reclaims the interrupted fragment and completes the plan
+	plan, err := inspection.Open(planPath)
+	test.OK(t, err)
+	for {
+		f := plan.Claim(time.Now(), inspection.DefaultLeaseDuration)
+		if f == nil {
+			break
+		}
+		test.OKs(t, runFragment(f))
+		for _, id := range f.Packs {
+			test.Assert(t, !covered.Has(id), "pack %v checked twice", id)
+			covered.Insert(id)
+		}
+		test.OK(t, plan.Succeed(f, time.Now()))
+	}
+	test.OK(t, plan.Save())
+	test.Equals(t, len(state.Packs), len(covered))
+
+	// a third run finds nothing to do
+	plan, err = inspection.Open(planPath)
+	test.OK(t, err)
+	done, failed, pending, claimed := plan.Counts()
+	test.Equals(t, len(state.Packs), done)
+	test.Equals(t, 0, failed+pending+claimed)
+	test.Assert(t, plan.Claim(time.Now(), inspection.DefaultLeaseDuration) == nil,
+		"completed plan must not offer fragments")
+
+	// removing a pack invalidates the stored plan
+	var removedPack restic.ID
+	for id := range state.Packs {
+		removedPack = id
+		break
+	}
+	test.OK(t, be.Remove(ctx, backend.Handle{Type: backend.PackFile, Name: removedPack.String()}))
+	// use a fresh checker so the physical pack listing is re-read
+	freshChkr := checker.New(repo, false)
+	test.OK(t, freshChkr.LoadSnapshots(ctx, &data.SnapshotFilter{}, nil))
+	_, indexErrs = freshChkr.LoadIndex(ctx, restic.NoopTerminalCounterFactory)
+	test.OKs(t, indexErrs)
+	changed, err := freshChkr.InspectionData(ctx)
+	test.OK(t, err)
+	test.Assert(t, fingerprintFor(changed) != fingerprint,
+		"fingerprint must change when a pack is removed")
+	test.Assert(t, !plan.Matches(fingerprintFor(changed)),
+		"stored plan must be detected as outdated")
 }
 
 // loadTreesOnceRepository allows each tree to be loaded only once

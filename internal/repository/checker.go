@@ -78,6 +78,10 @@ func (e *ErrPackData) Error() string {
 // Checker handles index-related operations for repository checking.
 type Checker struct {
 	repo *Repository
+
+	// listedPacks caches the packs physically stored in the backend, which is
+	// needed both by Packs and the persistent read-data inspection plan.
+	listedPacks map[restic.ID]int64
 }
 
 // newChecker creates a new Checker.
@@ -182,6 +186,37 @@ func (c *Checker) LoadIndex(ctx context.Context, p restic.TerminalCounterFactory
 	return hints, errs
 }
 
+// Config returns the repository configuration.
+func (c *Checker) Config() restic.Config {
+	return c.repo.Config()
+}
+
+// IndexIDs returns the IDs of the index files that are currently loaded.
+func (c *Checker) IndexIDs() restic.IDSet {
+	return c.repo.idx.IDs()
+}
+
+// ListStoredPacks returns the packs physically stored in the repository with
+// their backend sizes. The result is cached so that repeated calls within one
+// check do not list the backend twice. The returned map must not be modified.
+func (c *Checker) ListStoredPacks(ctx context.Context) (map[restic.ID]int64, error) {
+	if c.listedPacks != nil {
+		return c.listedPacks, nil
+	}
+
+	debug.Log("listing repository packs")
+	repoPacks := make(map[restic.ID]int64)
+	err := c.repo.List(ctx, restic.PackFile, func(id restic.ID, size int64) error {
+		repoPacks[id] = size
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	c.listedPacks = repoPacks
+	return c.listedPacks, nil
+}
+
 // Packs checks that all packs referenced in the index are still available and
 // there are no packs that aren't in an index. errChan is closed after all
 // packs have been checked.
@@ -197,16 +232,14 @@ func (c *Checker) Packs(ctx context.Context, errChan chan<- error) {
 
 	debug.Log("checking for %d packs", len(packs))
 
-	debug.Log("listing repository packs")
-	repoPacks := make(map[restic.ID]int64)
-
-	err = c.repo.List(ctx, restic.PackFile, func(id restic.ID, size int64) error {
+	storedPacks, listErr := c.ListStoredPacks(ctx)
+	if listErr != nil {
+		errChan <- listErr
+	}
+	// work on a copy as the cached map must not be modified
+	repoPacks := make(map[restic.ID]int64, len(storedPacks))
+	for id, size := range storedPacks {
 		repoPacks[id] = size
-		return nil
-	})
-
-	if err != nil {
-		errChan <- err
 	}
 
 	for id, size := range packs {

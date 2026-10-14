@@ -3,11 +3,9 @@ package main
 import (
 	"context"
 	"encoding/json"
-	"path"
-	"reflect"
 
 	"github.com/restic/restic/internal/data"
-	"github.com/restic/restic/internal/debug"
+	"github.com/restic/restic/internal/differ"
 	"github.com/restic/restic/internal/errors"
 	"github.com/restic/restic/internal/global"
 	"github.com/restic/restic/internal/restic"
@@ -63,9 +61,7 @@ Exit status is 12 if the password is incorrect.
 }
 
 // DiffOptions collects all options for the diff command.
-type DiffOptions struct {
-	ShowMetadata bool
-}
+type DiffOptions differ.Options
 
 func (opts *DiffOptions) AddFlags(f *pflag.FlagSet) {
 	f.BoolVar(&opts.ShowMetadata, "metadata", false, "print changes in metadata")
@@ -79,280 +75,13 @@ func loadSnapshot(ctx context.Context, be restic.Lister, repo restic.LoaderUnpac
 	return sn, subfolder, err
 }
 
-// Comparer collects all things needed to compare two snapshots.
-type Comparer struct {
-	repo        restic.BlobLoader
-	opts        DiffOptions
-	printChange func(change *Change)
-	printError  func(string, ...any)
-}
-
-type Change struct {
-	MessageType string `json:"message_type"` // "change"
-	Path        string `json:"path"`
-	Modifier    string `json:"modifier"`
-}
-
-func NewChange(path string, mode string) *Change {
-	return &Change{MessageType: "change", Path: path, Modifier: mode}
-}
-
-// DiffStat collects stats for all types of items.
-type DiffStat struct {
-	Files     int    `json:"files"`
-	Dirs      int    `json:"dirs"`
-	Others    int    `json:"others"`
-	DataBlobs int    `json:"data_blobs"`
-	TreeBlobs int    `json:"tree_blobs"`
-	Bytes     uint64 `json:"bytes"`
-}
-
-// Add adds stats information for node to s.
-func (s *DiffStat) Add(node *data.Node) {
-	if node == nil {
-		return
-	}
-
-	switch node.Type {
-	case data.NodeTypeFile:
-		s.Files++
-	case data.NodeTypeDir:
-		s.Dirs++
-	default:
-		s.Others++
-	}
-}
-
-// addBlobs adds the blobs of node to s.
-func addBlobs(bs restic.AssociatedBlobSet, node *data.Node) {
-	if node == nil {
-		return
-	}
-
-	switch node.Type {
-	case data.NodeTypeFile:
-		for _, blob := range node.Content {
-			h := restic.BlobHandle{
-				ID:   blob,
-				Type: restic.DataBlob,
-			}
-			bs.Insert(h)
-		}
-	case data.NodeTypeDir:
-		h := restic.BlobHandle{
-			ID:   *node.Subtree,
-			Type: restic.TreeBlob,
-		}
-		bs.Insert(h)
-	}
-}
-
-type DiffStatsContainer struct {
-	MessageType                          string                   `json:"message_type"` // "statistics"
-	SourceSnapshot                       string                   `json:"source_snapshot"`
-	TargetSnapshot                       string                   `json:"target_snapshot"`
-	ChangedFiles                         int                      `json:"changed_files"`
-	Added                                DiffStat                 `json:"added"`
-	Removed                              DiffStat                 `json:"removed"`
-	BlobsBefore, BlobsAfter, BlobsCommon restic.AssociatedBlobSet `json:"-"`
-}
-
-// updateBlobs updates the blob counters in the stats struct.
-func updateBlobs(repo restic.Loader, blobs restic.AssociatedBlobSet, stats *DiffStat, printError func(string, ...any)) {
-	for h := range blobs.Keys() {
-		switch h.Type {
-		case restic.DataBlob:
-			stats.DataBlobs++
-		case restic.TreeBlob:
-			stats.TreeBlobs++
-		}
-
-		size, found := repo.LookupBlobSize(h)
-		if !found {
-			printError("unable to find blob size for %v", h)
-			continue
-		}
-
-		stats.Bytes += uint64(size)
-	}
-}
-
-func (c *Comparer) printDir(ctx context.Context, mode string, stats *DiffStat, blobs restic.AssociatedBlobSet, prefix string, id restic.ID) error {
-	debug.Log("print %v tree %v", mode, id)
-	tree, err := data.LoadTree(ctx, c.repo, id)
-	if err != nil {
-		return err
-	}
-
-	for item := range tree {
-		if item.Error != nil {
-			return item.Error
-		}
-		if ctx.Err() != nil {
-			return ctx.Err()
-		}
-		node := item.Node
-		name := path.Join(prefix, node.Name)
-		if node.Type == data.NodeTypeDir {
-			name += "/"
-		}
-		c.printChange(NewChange(name, mode))
-		stats.Add(node)
-		addBlobs(blobs, node)
-
-		if node.Type == data.NodeTypeDir {
-			err := c.printDir(ctx, mode, stats, blobs, name, *node.Subtree)
-			if err != nil && err != context.Canceled {
-				c.printError("error: %v", err)
-			}
-		}
-	}
-
-	return ctx.Err()
-}
-
-func (c *Comparer) collectDir(ctx context.Context, blobs restic.AssociatedBlobSet, id restic.ID) error {
-	debug.Log("print tree %v", id)
-	tree, err := data.LoadTree(ctx, c.repo, id)
-	if err != nil {
-		return err
-	}
-
-	for item := range tree {
-		if item.Error != nil {
-			return item.Error
-		}
-		if ctx.Err() != nil {
-			return ctx.Err()
-		}
-
-		node := item.Node
-		addBlobs(blobs, node)
-
-		if node.Type == data.NodeTypeDir {
-			err := c.collectDir(ctx, blobs, *node.Subtree)
-			if err != nil && err != context.Canceled {
-				c.printError("error: %v", err)
-			}
-		}
-	}
-
-	return ctx.Err()
-}
-
-func (c *Comparer) diffTree(ctx context.Context, stats *DiffStatsContainer, prefix string, id1, id2 restic.ID) error {
-	debug.Log("diffing %v to %v", id1, id2)
-	tree1, err := data.LoadTree(ctx, c.repo, id1)
-	if err != nil {
-		return err
-	}
-
-	tree2, err := data.LoadTree(ctx, c.repo, id2)
-	if err != nil {
-		return err
-	}
-
-	for dt := range data.DualTreeIterator(tree1, tree2) {
-		if dt.Error != nil {
-			return dt.Error
-		}
-		if ctx.Err() != nil {
-			return ctx.Err()
-		}
-
-		node1 := dt.Tree1
-		node2 := dt.Tree2
-
-		var name string
-		if node1 != nil {
-			name = node1.Name
-		} else {
-			name = node2.Name
-		}
-
-		addBlobs(stats.BlobsBefore, node1)
-		addBlobs(stats.BlobsAfter, node2)
-
-		switch {
-		case node1 != nil && node2 != nil:
-			name := path.Join(prefix, name)
-			mod := ""
-
-			if node1.Type != node2.Type {
-				mod += "T"
-			}
-
-			if node2.Type == data.NodeTypeDir {
-				name += "/"
-			}
-
-			if node1.Type == data.NodeTypeFile &&
-				node2.Type == data.NodeTypeFile &&
-				!reflect.DeepEqual(node1.Content, node2.Content) {
-				mod += "M"
-				stats.ChangedFiles++
-
-				node1NilContent := *node1
-				node2NilContent := *node2
-				node1NilContent.Content = nil
-				node2NilContent.Content = nil
-				// the bitrot detection may not work if `backup --ignore-inode` or `--ignore-ctime` were used
-				if node1NilContent.Equals(node2NilContent) {
-					// probable bitrot detected
-					mod += "?"
-				}
-			} else if c.opts.ShowMetadata && !node1.Equals(*node2) {
-				mod += "U"
-			}
-
-			if mod != "" {
-				c.printChange(NewChange(name, mod))
-			}
-
-			if node1.Type == data.NodeTypeDir && node2.Type == data.NodeTypeDir {
-				var err error
-				if (*node1.Subtree).Equal(*node2.Subtree) {
-					err = c.collectDir(ctx, stats.BlobsCommon, *node1.Subtree)
-				} else {
-					err = c.diffTree(ctx, stats, name, *node1.Subtree, *node2.Subtree)
-				}
-				if err != nil && err != context.Canceled {
-					c.printError("error: %v", err)
-				}
-			}
-		case node1 != nil && node2 == nil:
-			prefix := path.Join(prefix, name)
-			if node1.Type == data.NodeTypeDir {
-				prefix += "/"
-			}
-			c.printChange(NewChange(prefix, "-"))
-			stats.Removed.Add(node1)
-
-			if node1.Type == data.NodeTypeDir {
-				err := c.printDir(ctx, "-", &stats.Removed, stats.BlobsBefore, prefix, *node1.Subtree)
-				if err != nil && err != context.Canceled {
-					c.printError("error: %v", err)
-				}
-			}
-		case node1 == nil && node2 != nil:
-			prefix := path.Join(prefix, name)
-			if node2.Type == data.NodeTypeDir {
-				prefix += "/"
-			}
-			c.printChange(NewChange(prefix, "+"))
-			stats.Added.Add(node2)
-
-			if node2.Type == data.NodeTypeDir {
-				err := c.printDir(ctx, "+", &stats.Added, stats.BlobsAfter, prefix, *node2.Subtree)
-				if err != nil && err != context.Canceled {
-					c.printError("error: %v", err)
-				}
-			}
-		}
-	}
-
-	return ctx.Err()
-}
+// The diff command and other in-repository callers (such as audit tasks) share
+// the comparison semantics in internal/differ.
+type (
+	Change             = differ.Change
+	DiffStat           = differ.Stat
+	DiffStatsContainer = differ.Stats
+)
 
 func runDiff(ctx context.Context, opts DiffOptions, gopts global.Options, args []string, term ui.Terminal) error {
 	if len(args) != 2 {
@@ -407,18 +136,15 @@ func runDiff(ctx context.Context, opts DiffOptions, gopts global.Options, args [
 		return err
 	}
 
-	c := &Comparer{
-		repo:       repo,
-		opts:       opts,
-		printError: printer.E,
-		printChange: func(change *Change) {
-			printer.S("%-5s%v", change.Modifier, change.Path)
-		},
-	}
+	c := differ.New(repo, differ.Options(opts))
+
+	printChange := differ.ChangeReporter(func(change *Change) {
+		printer.S("%-5s%v", change.Modifier, change.Path)
+	})
 
 	if gopts.JSON {
 		enc := json.NewEncoder(gopts.Term.OutputWriter())
-		c.printChange = func(change *Change) {
+		printChange = func(change *Change) {
 			err := enc.Encode(change)
 			if err != nil {
 				printer.E("JSON encode failed: %v", err)
@@ -427,28 +153,17 @@ func runDiff(ctx context.Context, opts DiffOptions, gopts global.Options, args [
 	}
 
 	if gopts.Quiet {
-		c.printChange = func(_ *Change) {}
+		printChange = func(_ *Change) {}
 	}
 
-	stats := &DiffStatsContainer{
-		MessageType:    "statistics",
-		SourceSnapshot: args[0],
-		TargetSnapshot: args[1],
-		BlobsBefore:    repo.NewAssociatedBlobSet(),
-		BlobsAfter:     repo.NewAssociatedBlobSet(),
-		BlobsCommon:    repo.NewAssociatedBlobSet(),
-	}
-	stats.BlobsBefore.Insert(restic.BlobHandle{Type: restic.TreeBlob, ID: *sn1.Tree})
-	stats.BlobsAfter.Insert(restic.BlobHandle{Type: restic.TreeBlob, ID: *sn2.Tree})
-
-	err = c.diffTree(ctx, stats, "/", *sn1.Tree, *sn2.Tree)
+	stats, err := c.Compare(ctx, *sn1.Tree, *sn2.Tree, printChange, printer.E)
 	if err != nil {
 		return err
 	}
+	c.Finalize(stats, printer.E)
 
-	both := stats.BlobsBefore.Intersect(stats.BlobsAfter)
-	updateBlobs(repo, stats.BlobsBefore.Sub(both).Sub(stats.BlobsCommon), &stats.Removed, printer.E)
-	updateBlobs(repo, stats.BlobsAfter.Sub(both).Sub(stats.BlobsCommon), &stats.Added, printer.E)
+	stats.SourceSnapshot = args[0]
+	stats.TargetSnapshot = args[1]
 
 	if gopts.JSON {
 		err := json.NewEncoder(gopts.Term.OutputWriter()).Encode(stats)
